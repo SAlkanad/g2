@@ -1,0 +1,1 @@
+"""Languages module for internationalization support"""

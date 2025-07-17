@@ -1,0 +1,20 @@
+aiogram==3.15.0
+python-dotenv==1.0.0
+telethon==1.39.0
+aiofiles==24.1.0
+cryptography==42.0.8
+firebase-admin==6.4.0
+# Using built-in cryptography library instead of pycryptodome
+
+# CLI and UI for session extractor
+click==8.1.7
+rich==13.7.0
+
+# Network and SSL libraries for improved resilience
+certifi==2024.2.2
+aiohttp==3.9.5
+urllib3==2.2.2
+pyOpenSSL==24.0.0
+
+# Note: Pyrogram removed - using direct SQLite analysis instead
+# pyrogram==2.0.106
