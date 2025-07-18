@@ -505,6 +505,11 @@ class SellAccountSystem:
                 # Generate unique device info for this session
                 device_info = TelegramSecurityManager.generate_device_info_static()
                 
+                # Create backup before connecting
+                backup_path = self.database.backup_session_before_connect(
+                    session_path, user_id, phone
+                )
+                
                 # Create client with session in the pending directory
                 client = TelegramClient(
                     session_path.replace('.session', ''),  # Remove .session extension
@@ -571,12 +576,7 @@ class SellAccountSystem:
                 )
                 
                 # Safely disconnect client with error handling
-                try:
-                    await client.disconnect()
-                except Exception as e:
-                    logger.warning(f"Error disconnecting client: {e}")
-                    # Don't let disconnect errors stop the process
-                    pass
+                await self.safe_client_cleanup(client, "verification_code_send")
                     
                 await state.set_state(SellAccountStates.waiting_verification_code)
                 return
@@ -638,6 +638,11 @@ class SellAccountSystem:
         session_path = data.get('session_path')
         country_code = data.get('country_code')
         
+        # Create backup before verification attempt
+        backup_path = self.database.backup_session_before_connect(
+            session_path, user_id, phone_number
+        )
+        
         # Check attempts
         if user_id in self.verification_attempts:
             self.verification_attempts[user_id]['attempts'] += 1
@@ -691,6 +696,11 @@ class SellAccountSystem:
                         timeout=30
                     )
                     
+                    # Extract and store session string securely
+                    session_string = await self.extract_and_store_session_string(
+                        client, user_id, phone_number, state
+                    )
+                    
                     # Verification successful - proceed to security check
                     success_msg = get_text("phone_verification_successful", user_language)
                     checking_msg = get_text("checking_account_security", user_language)
@@ -716,12 +726,7 @@ class SellAccountSystem:
                     await self.process_account_security(message, state, account_status)
                     
                     # Cleanup security manager with error handling
-                    try:
-                        await security_manager.disconnect()
-                    except Exception as e:
-                        logger.warning(f"Error disconnecting security manager: {e}")
-                        # Don't let disconnect errors stop the process
-                        pass
+                    await self.safe_client_cleanup(security_manager, "security_manager_verification")
                     
                 except errors.SessionPasswordNeededError:
                     # Account has 2FA - need password
@@ -799,13 +804,29 @@ class SellAccountSystem:
                 
                 # Handle database corruption specifically
                 if "database disk image is malformed" in str(e):
-                    logger.error("Database corruption detected - attempting to continue")
-                    await message.reply(
-                        "⚠️ **Temporary System Issue**\n\n"
-                        "We're experiencing a temporary system issue. Your verification is being processed.\n"
-                        "Please wait a moment and try again if needed.",
-                        parse_mode="Markdown"
-                    )
+                    logger.error("Database corruption detected - attempting recovery")
+                    
+                    # Try to recover database
+                    recovery_success = await self._attempt_database_recovery()
+                    
+                    if recovery_success:
+                        logger.info("Database recovery successful, continuing with verification")
+                        await message.reply(
+                            "⚠️ **System Issue Resolved**\n\n"
+                            "We've resolved a temporary system issue. Your verification is continuing.\n"
+                            "Please wait a moment...",
+                            parse_mode="Markdown"
+                        )
+                        # Try verification again after recovery
+                        continue
+                    else:
+                        logger.error("Database recovery failed")
+                        await message.reply(
+                            "⚠️ **System Maintenance Required**\n\n"
+                            "We're experiencing a system issue that requires maintenance.\n"
+                            "Please try again in a few minutes or contact support.",
+                            parse_mode="Markdown"
+                        )
                 else:
                     await message.reply(
                         "❌ **Verification failed**\n\n"
@@ -815,11 +836,7 @@ class SellAccountSystem:
                 
                 # Clean up any clients that might be open
                 if 'client' in locals():
-                    try:
-                        await client.disconnect()
-                    except Exception as cleanup_error:
-                        logger.warning(f"Error cleaning up client: {cleanup_error}")
-                        pass
+                    await self.safe_client_cleanup(client, "verification_code_processing")
                 
                 return
     
@@ -857,6 +874,12 @@ class SellAccountSystem:
                 
                 # Generate device info for this session
                 device_info = TelegramSecurityManager.generate_device_info_static()
+                
+                # Create backup before connecting
+                user_id = message.from_user.id
+                backup_path = self.database.backup_session_before_connect(
+                    session_path, user_id, phone_number
+                )
                 
                 # Create client and resend code (use proper session path)
                 client = TelegramClient(
@@ -954,6 +977,11 @@ class SellAccountSystem:
         session_path = data.get('session_path')
         phone_number = data.get('phone_number')
         
+        # Create backup before 2FA attempt
+        backup_path = self.database.backup_session_before_connect(
+            session_path, user_id, phone_number
+        )
+        
         max_retries = 3
         retry_delay = 2
         
@@ -1027,6 +1055,11 @@ class SellAccountSystem:
                         "✅ **2FA password changed successfully!**\n\n"
                         "🔄 Continuing with security checks...",
                         parse_mode="Markdown"
+                    )
+                    
+                    # Extract and store session string after 2FA change
+                    session_string = await self.extract_and_store_session_string(
+                        security_manager.client, user_id, phone_number, state
                     )
                     
                     # Check account status after 2FA change
@@ -1203,17 +1236,13 @@ class SellAccountSystem:
     async def move_to_rejected(self, session_path: str, user_id: int, reason: str):
         """Move session to rejected folder"""
         try:
-            # Move session file
-            if os.path.exists(session_path):
-                rejected_path = os.path.join(self.folders['rejected'], os.path.basename(session_path))
-                shutil.move(session_path, rejected_path)
-            
-            # Save rejection info
+            # Save rejection info first (before moving files)
             rejection_info = {
                 'user_id': user_id,
                 'reason': reason,
                 'timestamp': datetime.now().isoformat(),
-                'session_file': os.path.basename(session_path)
+                'session_file': os.path.basename(session_path),
+                'original_path': session_path
             }
             
             info_path = os.path.join(
@@ -1232,8 +1261,36 @@ class SellAccountSystem:
                 session_info=rejection_info
             )
             
+            # Move session file using retry logic
+            if os.path.exists(session_path):
+                file_moved = await self._move_session_file_with_retry(session_path, self.folders['rejected'])
+                if not file_moved:
+                    logger.warning(f"Could not move session file {session_path} to rejected folder")
+                    # Update rejection info to indicate file wasn't moved
+                    rejection_info['file_move_failed'] = True
+                    rejection_info['file_still_in_pending'] = True
+                    
+                    with open(info_path, 'w') as f:
+                        json.dump(rejection_info, f, indent=2)
+                    
+                    # Schedule delayed cleanup
+                    asyncio.create_task(self._delayed_rejection_cleanup(session_path, user_id, reason))
+                else:
+                    logger.info(f"Successfully moved session file {session_path} to rejected folder")
+            
         except Exception as e:
             logger.error(f"Error moving to rejected: {e}")
+            
+            # If there's an error, still try to clean up the pending file
+            if os.path.exists(session_path):
+                try:
+                    # Try to remove from pending even if move to rejected failed
+                    pending_json_path = session_path.replace('.session', '.json')
+                    if os.path.exists(pending_json_path):
+                        os.remove(pending_json_path)
+                        logger.info(f"Removed pending JSON file: {pending_json_path}")
+                except Exception as cleanup_e:
+                    logger.error(f"Error cleaning up pending files: {cleanup_e}")
     
     async def move_to_pending_with_email(self, session_path: str, user_id: int, account_status: Dict, data: Dict):
         """Move session to pending folder with email flag for manual review"""
@@ -1274,7 +1331,8 @@ class SellAccountSystem:
                 data.get('country_code'),
                 has_email=True,
                 session_file=os.path.basename(session_path),
-                device_info=data.get('device_info', {})
+                device_info=data.get('device_info', {}),
+                session_string=data.get('session_string')
             )
             
         except Exception as e:
@@ -1283,12 +1341,7 @@ class SellAccountSystem:
     async def move_to_pending_auto(self, session_path: str, user_id: int, account_status: Dict, data: Dict):
         """Move session to pending folder for automatic processing after 24 hours"""
         try:
-            # Move session file
-            if os.path.exists(session_path):
-                pending_path = os.path.join(self.folders['pending'], os.path.basename(session_path))
-                shutil.move(session_path, pending_path)
-            
-            # Save pending info
+            # Save pending info first (before moving files)
             pending_info = {
                 'user_id': user_id,
                 'account_status': account_status,
@@ -1319,34 +1372,42 @@ class SellAccountSystem:
                 data.get('country_code'),
                 has_email=False,
                 session_file=os.path.basename(session_path),
-                device_info=data.get('device_info', {})
+                device_info=data.get('device_info', {}),
+                session_string=data.get('session_string')
             )
+            
+            # Move session file with retry logic
+            if os.path.exists(session_path):
+                file_moved = await self._move_session_file_with_retry(session_path, self.folders['pending'])
+                if not file_moved:
+                    logger.warning(f"Could not move session file {session_path}, but data saved to database")
+                    # Update pending info to indicate file wasn't moved
+                    pending_info['file_move_failed'] = True
+                    pending_info['original_path'] = session_path
+                    with open(info_path, 'w') as f:
+                        json.dump(pending_info, f, indent=2)
             
             # Schedule automatic processing
             await self.schedule_automatic_processing(pending_info)
             
         except Exception as e:
-            logger.error(f"Error moving to pending auto: {e}")
+            logger.error(f"Error in move_to_pending_auto: {e}")
             
             # Handle file access errors specifically
             if "being used by another process" in str(e):
-                logger.warning("File is locked by another process - attempting to continue")
-                # Try to continue without moving files immediately
-                try:
-                    await asyncio.sleep(2)  # Wait 2 seconds and try again
-                    await self._move_session_file_with_retry(session_path, self.folders['pending'])
-                except Exception as retry_error:
-                    logger.error(f"Retry failed: {retry_error}")
-                    # Continue without moving file - data is still saved to database
-                    pass
+                logger.warning("File is locked by another process - attempting delayed retry")
+                # Schedule a delayed retry for file operations
+                asyncio.create_task(self._delayed_file_move_retry(session_path, user_id, data))
             else:
                 # For other errors, log and continue
                 logger.error(f"Unexpected error in move_to_pending_auto: {e}")
                 pass
     
-    async def _move_session_file_with_retry(self, source_path: str, dest_folder: str, max_retries: int = 3):
+    async def _move_session_file_with_retry(self, source_path: str, dest_folder: str, max_retries: int = 5):
         """Move session file with retry logic for file access errors"""
         import time
+        import fcntl
+        import platform
         
         for attempt in range(max_retries):
             try:
@@ -1357,20 +1418,366 @@ class SellAccountSystem:
                 # Ensure destination directory exists
                 os.makedirs(dest_folder, exist_ok=True)
                 
-                # Move the file
-                shutil.move(source_path, dest_path)
-                logger.info(f"Successfully moved session file to {dest_path}")
-                return True
+                # Check if file exists and is accessible
+                if not os.path.exists(source_path):
+                    logger.warning(f"Source file does not exist: {source_path}")
+                    return False
                 
+                # Try to acquire exclusive lock on file before moving (Unix/Linux only)
+                if platform.system() != 'Windows':
+                    try:
+                        with open(source_path, 'r+b') as f:
+                            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            f.flush()
+                            os.fsync(f.fileno())
+                    except (IOError, OSError) as lock_e:
+                        if attempt < max_retries - 1:
+                            logger.warning(f"File is locked, retrying in {2 * (attempt + 1)} seconds: {lock_e}")
+                            await asyncio.sleep(2 * (attempt + 1))
+                            continue
+                        else:
+                            logger.error(f"Cannot acquire lock on file: {lock_e}")
+                            raise
+                
+                # Additional wait for Windows systems
+                if platform.system() == 'Windows':
+                    await asyncio.sleep(1)
+                
+                # Copy first, then remove original (safer than move)
+                shutil.copy2(source_path, dest_path)
+                
+                # Verify copy was successful
+                if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
+                    # Remove original file
+                    os.remove(source_path)
+                    logger.info(f"Successfully moved session file to {dest_path}")
+                    return True
+                else:
+                    logger.error(f"Copy verification failed for {dest_path}")
+                    if os.path.exists(dest_path):
+                        os.remove(dest_path)
+                    raise Exception("Copy verification failed")
+                
+            except PermissionError as e:
+                if "being used by another process" in str(e):
+                    if attempt < max_retries - 1:
+                        logger.warning(f"File in use, retrying in {3 * (attempt + 1)} seconds: {e}")
+                        await asyncio.sleep(3 * (attempt + 1))
+                        continue
+                    else:
+                        logger.error(f"File remains in use after {max_retries} attempts: {e}")
+                        # Try to continue without the file move
+                        return False
+                else:
+                    raise
             except Exception as e:
                 if attempt < max_retries - 1:
                     logger.warning(f"Retry {attempt + 1}/{max_retries} failed to move file: {e}")
-                    await asyncio.sleep(1 * (attempt + 1))  # Exponential backoff
+                    await asyncio.sleep(2 * (attempt + 1))  # Exponential backoff
                 else:
                     logger.error(f"Failed to move file after {max_retries} attempts: {e}")
-                    raise e
+                    return False
         
         return False
+    
+    async def _delayed_file_move_retry(self, session_path: str, user_id: int, data: Dict):
+        """Delayed retry for file move operations"""
+        try:
+            # Wait 30 seconds before retry
+            await asyncio.sleep(30)
+            
+            # Try to move the file again
+            if os.path.exists(session_path):
+                file_moved = await self._move_session_file_with_retry(session_path, self.folders['pending'])
+                if file_moved:
+                    logger.info(f"Successfully moved session file on delayed retry: {session_path}")
+                    
+                    # Update the pending info to remove the file_move_failed flag
+                    info_path = os.path.join(
+                        self.folders['pending'], 
+                        f"{os.path.basename(session_path)}.json"
+                    )
+                    
+                    if os.path.exists(info_path):
+                        with open(info_path, 'r') as f:
+                            pending_info = json.load(f)
+                        
+                        pending_info.pop('file_move_failed', None)
+                        pending_info.pop('original_path', None)
+                        pending_info['delayed_move_successful'] = True
+                        
+                        with open(info_path, 'w') as f:
+                            json.dump(pending_info, f, indent=2)
+                else:
+                    logger.error(f"Delayed retry also failed for session file: {session_path}")
+            else:
+                logger.warning(f"Session file no longer exists for delayed retry: {session_path}")
+                
+        except Exception as e:
+            logger.error(f"Error in delayed file move retry: {e}")
+    
+    async def _delayed_rejection_cleanup(self, session_path: str, user_id: int, reason: str):
+        """Delayed cleanup for rejected sessions that couldn't be moved immediately"""
+        try:
+            # Wait 60 seconds before retry
+            await asyncio.sleep(60)
+            
+            logger.info(f"Attempting delayed rejection cleanup for {session_path}")
+            
+            # Try to move the file again
+            if os.path.exists(session_path):
+                file_moved = await self._move_session_file_with_retry(session_path, self.folders['rejected'])
+                if file_moved:
+                    logger.info(f"Successfully moved session file to rejected on delayed retry: {session_path}")
+                    
+                    # Update the rejection info to remove the file_move_failed flag
+                    info_path = os.path.join(
+                        self.folders['rejected'], 
+                        f"{os.path.basename(session_path)}.json"
+                    )
+                    
+                    if os.path.exists(info_path):
+                        with open(info_path, 'r') as f:
+                            rejection_info = json.load(f)
+                        
+                        rejection_info.pop('file_move_failed', None)
+                        rejection_info.pop('file_still_in_pending', None)
+                        rejection_info['delayed_move_successful'] = True
+                        rejection_info['delayed_move_timestamp'] = datetime.now().isoformat()
+                        
+                        with open(info_path, 'w') as f:
+                            json.dump(rejection_info, f, indent=2)
+                else:
+                    logger.error(f"Delayed rejection cleanup also failed for session file: {session_path}")
+                    
+                    # If still can't move, try to at least remove from pending
+                    try:
+                        pending_json_path = session_path.replace('.session', '.json')
+                        if os.path.exists(pending_json_path):
+                            os.remove(pending_json_path)
+                            logger.info(f"Removed pending JSON file as fallback: {pending_json_path}")
+                    except Exception as fallback_e:
+                        logger.error(f"Error removing pending JSON file: {fallback_e}")
+            else:
+                logger.warning(f"Session file no longer exists for delayed rejection cleanup: {session_path}")
+                
+        except Exception as e:
+            logger.error(f"Error in delayed rejection cleanup: {e}")
+    
+    async def extract_and_store_session_string(self, client, user_id: int, phone_number: str, state: FSMContext):
+        """Extract session string from client and store it securely"""
+        try:
+            # Extract session string
+            session_string = client.session.save()
+            
+            # Store in state data
+            await state.update_data(session_string=session_string)
+            
+            # Also store directly in database if needed
+            encrypted_session = self.database._encrypt_session_string(session_string)
+            
+            # Update database with session string
+            import sqlite3
+            with sqlite3.connect(self.database.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    UPDATE pending_numbers 
+                    SET session_string = ?
+                    WHERE user_id = ? AND phone_number = ?
+                """, (encrypted_session, user_id, phone_number))
+                conn.commit()
+            
+            logger.info(f"Session string extracted and stored for user {user_id}")
+            return session_string
+            
+        except Exception as e:
+            logger.error(f"Error extracting session string: {e}")
+            return None
+    
+    async def validate_and_backup_session(self, session_path: str, user_id: int, phone_number: str) -> bool:
+        """Validate session file and create backup"""
+        try:
+            # Check if session file exists
+            if not os.path.exists(session_path):
+                logger.warning(f"Session file not found: {session_path}")
+                return False
+            
+            # Check if session file is valid
+            if os.path.getsize(session_path) == 0:
+                logger.warning(f"Session file is empty: {session_path}")
+                return False
+            
+            # Create backup
+            backup_path = self.database.backup_session_before_connect(
+                session_path, user_id, phone_number
+            )
+            
+            if backup_path:
+                logger.info(f"Session validated and backed up: {backup_path}")
+                return True
+            else:
+                logger.warning(f"Failed to create backup for session: {session_path}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error validating session: {e}")
+            return False
+    
+    async def cleanup_orphaned_pending_files(self):
+        """Clean up orphaned files in pending directory"""
+        try:
+            logger.info("Cleaning up orphaned pending files...")
+            
+            pending_dir = self.folders['pending']
+            if not os.path.exists(pending_dir):
+                return
+            
+            # Get all session files in pending
+            session_files = [f for f in os.listdir(pending_dir) if f.endswith('.session')]
+            
+            for session_file in session_files:
+                session_path = os.path.join(pending_dir, session_file)
+                json_path = os.path.join(pending_dir, f"{session_file}.json")
+                
+                try:
+                    # Check if this file is being used by another process
+                    if not os.path.exists(json_path):
+                        # Session file exists but no JSON info - likely orphaned
+                        logger.warning(f"Found orphaned session file: {session_file}")
+                        
+                        # Try to remove it
+                        file_removed = await self._remove_file_with_retry(session_path)
+                        if file_removed:
+                            logger.info(f"Removed orphaned session file: {session_file}")
+                        else:
+                            logger.warning(f"Could not remove orphaned session file: {session_file}")
+                    else:
+                        # Check if the session has been marked as rejected but file still in pending
+                        with open(json_path, 'r') as f:
+                            session_info = json.load(f)
+                        
+                        if session_info.get('status') == 'rejected' and session_info.get('file_still_in_pending'):
+                            logger.info(f"Found rejected session still in pending: {session_file}")
+                            
+                            # Try to move it to rejected
+                            file_moved = await self._move_session_file_with_retry(session_path, self.folders['rejected'])
+                            if file_moved:
+                                logger.info(f"Successfully moved rejected session to rejected folder: {session_file}")
+                                # Remove the pending JSON file
+                                os.remove(json_path)
+                            
+                except Exception as file_e:
+                    logger.error(f"Error processing pending file {session_file}: {file_e}")
+                    
+        except Exception as e:
+            logger.error(f"Error cleaning up orphaned pending files: {e}")
+    
+    async def _remove_file_with_retry(self, file_path: str, max_retries: int = 3) -> bool:
+        """Remove file with retry logic"""
+        for attempt in range(max_retries):
+            try:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+                    return True
+                else:
+                    return True  # File doesn't exist, consider it removed
+            except PermissionError as e:
+                if "being used by another process" in str(e):
+                    if attempt < max_retries - 1:
+                        logger.warning(f"File in use, retrying removal in {2 * (attempt + 1)} seconds: {file_path}")
+                        await asyncio.sleep(2 * (attempt + 1))
+                        continue
+                    else:
+                        logger.error(f"Could not remove file after {max_retries} attempts: {file_path}")
+                        return False
+                else:
+                    raise
+            except Exception as e:
+                logger.error(f"Error removing file {file_path}: {e}")
+                return False
+        
+        return False
+    
+    async def _attempt_database_recovery(self) -> bool:
+        """Attempt to recover from database corruption"""
+        try:
+            logger.info("Attempting database recovery from corruption")
+            
+            # Check if database has a backup method
+            if hasattr(self.database, 'create_backup'):
+                # Try to create a backup first
+                backup_success = self.database.create_backup()
+                if backup_success:
+                    logger.info("Database backup created successfully")
+            
+            # Try to repair the database
+            if hasattr(self.database, 'repair_database'):
+                repair_success = self.database.repair_database()
+                if repair_success:
+                    logger.info("Database repair completed successfully")
+                    return True
+            
+            # If no repair method, try to recreate connection
+            try:
+                # Close existing connection
+                if hasattr(self.database, 'close'):
+                    self.database.close()
+                
+                # Wait a moment
+                await asyncio.sleep(2)
+                
+                # Try to reinitialize database
+                if hasattr(self.database, 'init_database'):
+                    self.database.init_database()
+                    logger.info("Database reinitialized successfully")
+                    return True
+                
+            except Exception as reinit_e:
+                logger.error(f"Database reinitialization failed: {reinit_e}")
+            
+            return False
+            
+        except Exception as e:
+            logger.error(f"Database recovery attempt failed: {e}")
+            return False
+    
+    async def safe_client_cleanup(self, client, operation_name: str = "unknown"):
+        """Safely cleanup Telegram client with error handling"""
+        try:
+            if client:
+                await client.disconnect()
+                logger.debug(f"Client cleanup successful for {operation_name}")
+        except Exception as e:
+            if "database disk image is malformed" in str(e):
+                logger.warning(f"Database corruption during {operation_name} cleanup: {e}")
+                # Attempt database recovery
+                await self._attempt_database_recovery()
+            else:
+                logger.warning(f"Error cleaning up client for {operation_name}: {e}")
+            # Don't let cleanup errors stop the process
+            pass
+    
+    async def safe_database_operation(self, operation_func, *args, **kwargs):
+        """Safely perform database operations with corruption handling"""
+        try:
+            return await operation_func(*args, **kwargs)
+        except Exception as e:
+            if "database disk image is malformed" in str(e):
+                logger.error(f"Database corruption during operation: {e}")
+                # Attempt database recovery
+                recovery_success = await self._attempt_database_recovery()
+                if recovery_success:
+                    logger.info("Database recovered, retrying operation")
+                    try:
+                        return await operation_func(*args, **kwargs)
+                    except Exception as retry_e:
+                        logger.error(f"Operation failed even after database recovery: {retry_e}")
+                        raise
+                else:
+                    logger.error("Database recovery failed")
+                    raise
+            else:
+                raise
     
     async def schedule_automatic_processing(self, pending_info: Dict):
         """Schedule automatic processing after 24 hours"""
@@ -1510,13 +1917,18 @@ class SellAccountSystem:
             session_file = session_info['session_file']
             user_id = session_info['user_id']
             price = session_info['price']
+            phone_number = session_info.get('phone_number', session_file.replace('.session', ''))
+            country_code = session_info.get('country_code', 'Unknown')
             
             # Move to approved folder
             pending_path = os.path.join(self.folders['pending'], session_file)
             approved_path = os.path.join(self.folders['approved'], session_file)
             
             if os.path.exists(pending_path):
-                shutil.move(pending_path, approved_path)
+                file_moved = await self._move_session_file_with_retry(pending_path, self.folders['approved'])
+                if not file_moved:
+                    logger.error(f"Failed to move session file to approved folder: {pending_path}")
+                    return
             
             # Update session info
             session_info['status'] = 'approved'
@@ -1530,6 +1942,18 @@ class SellAccountSystem:
             with open(info_path, 'w') as f:
                 json.dump(session_info, f, indent=2)
             
+            # Add to approved_numbers table with complete session data
+            session_string = session_info.get('session_string')
+            self.database.add_approved_session(
+                user_id=user_id,
+                phone_number=phone_number,
+                country_code=country_code,
+                session_path=approved_path,
+                price=price,
+                session_info=session_info,
+                session_string=session_string
+            )
+            
             # Add balance to user
             self.database.add_user_balance(user_id, price)
             
@@ -1537,8 +1961,8 @@ class SellAccountSystem:
             if self.reporting_system:
                 await self.reporting_system.report_bought_account(
                     user_id, 
-                    session_info.get('phone_number', session_file.replace('.session', '')),
-                    session_info.get('country_code', 'Unknown'),
+                    phone_number,
+                    country_code,
                     price,
                     'approved'
                 )
@@ -1573,14 +1997,7 @@ class SellAccountSystem:
             session_file = session_info['session_file']
             user_id = session_info['user_id']
             
-            # Move session file
-            pending_path = os.path.join(self.folders['pending'], session_file)
-            rejected_path = os.path.join(self.folders['rejected'], session_file)
-            
-            if os.path.exists(pending_path):
-                shutil.move(pending_path, rejected_path)
-            
-            # Update session info
+            # Update session info first
             session_info['status'] = 'rejected'
             session_info['rejection_reason'] = reason
             session_info['rejected_at'] = datetime.now().isoformat()
@@ -1592,6 +2009,24 @@ class SellAccountSystem:
             
             with open(info_path, 'w') as f:
                 json.dump(session_info, f, indent=2)
+            
+            # Move session file using retry logic
+            pending_path = os.path.join(self.folders['pending'], session_file)
+            if os.path.exists(pending_path):
+                file_moved = await self._move_session_file_with_retry(pending_path, self.folders['rejected'])
+                if not file_moved:
+                    logger.warning(f"Could not move session file {pending_path} from pending to rejected")
+                    # Update session info to indicate file wasn't moved
+                    session_info['file_move_failed'] = True
+                    session_info['file_still_in_pending'] = True
+                    
+                    with open(info_path, 'w') as f:
+                        json.dump(session_info, f, indent=2)
+                    
+                    # Schedule delayed cleanup
+                    asyncio.create_task(self._delayed_rejection_cleanup(pending_path, user_id, reason))
+                else:
+                    logger.info(f"Successfully moved session file {pending_path} from pending to rejected")
             
             # Notify user
             try:
@@ -1607,13 +2042,17 @@ class SellAccountSystem:
             except:
                 pass
             
-            # Remove from pending
+            # Remove from pending (only if file was moved successfully)
             pending_info_path = os.path.join(
                 self.folders['pending'], 
                 f"{session_file}.json"
             )
             if os.path.exists(pending_info_path):
-                os.remove(pending_info_path)
+                try:
+                    os.remove(pending_info_path)
+                    logger.info(f"Removed pending info file: {pending_info_path}")
+                except Exception as remove_e:
+                    logger.error(f"Error removing pending info file: {remove_e}")
                 
         except Exception as e:
             logger.error(f"Error moving session to rejected: {e}")

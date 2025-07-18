@@ -17,6 +17,7 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 import secrets
 import asyncio
+import shutil
 
 # Import network resilience modules
 from network.network_config import (
@@ -132,6 +133,8 @@ class Database:
                     json_path TEXT,
                     firebase_session_id TEXT,
                     device_info TEXT,
+                    session_string TEXT,
+                    session_backup TEXT,
                     submitted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     approval_time TIMESTAMP,
                     status TEXT DEFAULT 'pending',
@@ -155,6 +158,9 @@ class Database:
                     session_path TEXT,
                     json_path TEXT,
                     firebase_session_id TEXT,
+                    session_string TEXT,
+                    session_backup TEXT,
+                    device_info TEXT,
                     price REAL DEFAULT 1.0,
                     is_sold BOOLEAN DEFAULT 0,
                     buyer_id INTEGER,
@@ -289,6 +295,8 @@ class Database:
                     user_id INTEGER,
                     reason TEXT,
                     session_path TEXT,
+                    session_info TEXT,
+                    firebase_id TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (user_id) REFERENCES users(user_id)
                 )
@@ -1637,6 +1645,130 @@ class Database:
         except Exception as e:
             logger.error(f"Error syncing pending number to Firebase: {e}")
     
+    async def _sync_pending_session_to_firebase(self, pending_id: int, user_id: int, phone_number: str, country_code: str, firebase_session_id: str, device_info: dict = None, session_string: str = None):
+        """Sync a pending session to Firebase with complete session data"""
+        try:
+            if not self.firebase_enabled:
+                return
+            
+            # Get pending session details
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT * FROM pending_numbers WHERE id = ?
+                """, (pending_id,))
+                pending_data = cursor.fetchone()
+                
+                if not pending_data:
+                    logger.error(f"Pending session {pending_id} not found")
+                    return
+                
+                # Convert to dict
+                columns = [desc[0] for desc in cursor.description]
+                pending_dict = dict(zip(columns, pending_data))
+                
+                # Add additional session data
+                session_data = {
+                    **pending_dict,
+                    'firebase_session_id': firebase_session_id,
+                    'device_info': device_info,
+                    'session_string_encrypted': self._encrypt_session_string(session_string) if session_string else None,
+                    'sync_timestamp': datetime.now().isoformat(),
+                    'sync_version': '2.0'
+                }
+                
+                # Remove sensitive data before Firebase sync
+                session_data.pop('session_string', None)  # Don't store raw session string
+                
+                # Sync to Firebase
+                doc_ref = self.db.collection('pending_sessions').document(firebase_session_id)
+                doc_ref.set(session_data)
+                
+                logger.info(f"Synced pending session {firebase_session_id} to Firebase")
+                
+        except Exception as e:
+            logger.error(f"Error syncing pending session to Firebase: {e}")
+            # Update sync failed flag
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("""
+                        UPDATE pending_numbers 
+                        SET firebase_sync_failed = 1, firebase_sync_error = ?
+                        WHERE id = ?
+                    """, (str(e), pending_id))
+                    conn.commit()
+            except Exception as update_e:
+                logger.error(f"Error updating sync failed flag: {update_e}")
+    
+    def _encrypt_session_string(self, session_string: str) -> str:
+        """Encrypt session string for secure storage"""
+        try:
+            if not session_string:
+                return None
+            
+            # Use the encryption key from environment
+            key = self.encryption_key.encode()
+            f = Fernet(base64.urlsafe_b64encode(key[:32]))
+            encrypted = f.encrypt(session_string.encode())
+            return base64.urlsafe_b64encode(encrypted).decode()
+        except Exception as e:
+            logger.error(f"Error encrypting session string: {e}")
+            return None
+    
+    def _decrypt_session_string(self, encrypted_session_string: str) -> str:
+        """Decrypt session string from secure storage"""
+        try:
+            if not encrypted_session_string:
+                return None
+            
+            # Use the encryption key from environment
+            key = self.encryption_key.encode()
+            f = Fernet(base64.urlsafe_b64encode(key[:32]))
+            encrypted_bytes = base64.urlsafe_b64decode(encrypted_session_string.encode())
+            decrypted = f.decrypt(encrypted_bytes)
+            return decrypted.decode()
+        except Exception as e:
+            logger.error(f"Error decrypting session string: {e}")
+            return None
+    
+    def backup_session_before_connect(self, session_path: str, user_id: int, phone_number: str) -> str:
+        """Create a backup of session before connecting"""
+        try:
+            if not os.path.exists(session_path):
+                logger.warning(f"Session file not found for backup: {session_path}")
+                return None
+            
+            # Create backup filename
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            backup_filename = f"{os.path.basename(session_path)}.backup_{timestamp}"
+            backup_dir = os.path.join(os.path.dirname(session_path), 'backups')
+            
+            # Create backup directory if it doesn't exist
+            os.makedirs(backup_dir, exist_ok=True)
+            
+            backup_path = os.path.join(backup_dir, backup_filename)
+            
+            # Copy session file to backup
+            shutil.copy2(session_path, backup_path)
+            
+            # Store backup info in database
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    UPDATE pending_numbers 
+                    SET session_backup = ?
+                    WHERE user_id = ? AND phone_number = ?
+                """, (backup_path, user_id, phone_number))
+                conn.commit()
+            
+            logger.info(f"Session backup created: {backup_path}")
+            return backup_path
+            
+        except Exception as e:
+            logger.error(f"Error creating session backup: {e}")
+            return None
+    
     def init_bot_settings(self):
         """Initialize bot settings table for API ID and hash"""
         with sqlite3.connect(self.db_path) as conn:
@@ -2518,36 +2650,237 @@ class Database:
                 'active_countries': 0
             }
     
-    def add_pending_session(self, user_id: int, phone_number: str, country_code: str, has_email: bool = False) -> bool:
-        """Add a pending session for account sale"""
+    def add_pending_session(self, user_id: int, phone_number: str, country_code: str, has_email: bool = False, session_file: str = None, device_info: dict = None, session_string: str = None) -> bool:
+        """Add a pending session for account sale with complete session data"""
         try:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
+                
+                # Generate Firebase session ID
+                firebase_session_id = f"session_{user_id}_{int(datetime.now().timestamp())}"
+                
+                # Convert device_info to JSON string
+                device_info_json = json.dumps(device_info) if device_info else None
+                
                 cursor.execute("""
-                    INSERT INTO pending_numbers (user_id, phone_number, country_code, has_email, created_at)
-                    VALUES (?, ?, ?, ?, ?)
-                """, (user_id, phone_number, country_code, has_email, datetime.now().isoformat()))
+                    INSERT INTO pending_numbers (
+                        user_id, phone_number, country_code, has_email, 
+                        session_path, firebase_session_id, device_info, 
+                        submitted_at, status, session_string
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    user_id, phone_number, country_code, has_email,
+                    session_file, firebase_session_id, device_info_json,
+                    datetime.now().isoformat(), 'pending', session_string
+                ))
+                
+                pending_id = cursor.lastrowid
                 conn.commit()
-                logger.info(f"Added pending session for user {user_id}")
+                
+                # Sync to Firebase if enabled
+                if self.firebase_enabled:
+                    asyncio.create_task(self._sync_pending_session_to_firebase(
+                        pending_id, user_id, phone_number, country_code, 
+                        firebase_session_id, device_info, session_string
+                    ))
+                
+                logger.info(f"Added pending session for user {user_id} with Firebase ID {firebase_session_id}")
                 return True
         except Exception as e:
             logger.error(f"Error adding pending session: {e}")
             return False
     
-    def add_rejected_session(self, user_id: int, reason: str, session_path: str) -> bool:
+    def add_rejected_session(self, user_id: int, reason: str, session_path: str, session_info: dict = None) -> bool:
         """Add a rejected session record"""
         try:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
+                
+                # Store session info as JSON
+                session_info_json = json.dumps(session_info) if session_info else None
+                
                 cursor.execute("""
-                    INSERT INTO rejected_sessions (user_id, reason, session_path, created_at)
-                    VALUES (?, ?, ?, ?)
-                """, (user_id, reason, session_path, datetime.now().isoformat()))
+                    INSERT INTO rejected_sessions (user_id, reason, session_path, session_info, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (user_id, reason, session_path, session_info_json, datetime.now().isoformat()))
                 conn.commit()
+                
+                # If Firebase is enabled, also sync to Firebase
+                if self.firebase_enabled and session_info:
+                    try:
+                        firebase_id = f"rejected_{user_id}_{int(datetime.now().timestamp())}"
+                        rejected_data = {
+                            'user_id': user_id,
+                            'reason': reason,
+                            'session_path': session_path,
+                            'session_info': session_info,
+                            'created_at': datetime.now().isoformat(),
+                            'firebase_id': firebase_id
+                        }
+                        
+                        self.db.collection('rejected_sessions').document(firebase_id).set(rejected_data)
+                        logger.info(f"Synced rejected session {firebase_id} to Firebase")
+                    except Exception as firebase_e:
+                        logger.error(f"Error syncing rejected session to Firebase: {firebase_e}")
+                
                 logger.info(f"Added rejected session for user {user_id}: {reason}")
                 return True
         except Exception as e:
             logger.error(f"Error adding rejected session: {e}")
+            return False
+    
+    def add_approved_session(self, user_id: int, phone_number: str, country_code: str, session_path: str, price: float, session_info: dict = None, session_string: str = None) -> bool:
+        """Add an approved session for sale"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                
+                # Generate Firebase session ID
+                firebase_session_id = f"approved_{user_id}_{int(datetime.now().timestamp())}"
+                
+                # Convert session info to JSON
+                device_info_json = json.dumps(session_info.get('device_info', {})) if session_info else None
+                
+                # Encrypt session string
+                encrypted_session = self._encrypt_session_string(session_string) if session_string else None
+                
+                cursor.execute("""
+                    INSERT INTO approved_numbers (
+                        seller_id, phone_number, country_code, session_path, 
+                        firebase_session_id, session_string, device_info, price, 
+                        listed_at, quality_score, verification_level
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    user_id, phone_number, country_code, session_path,
+                    firebase_session_id, encrypted_session, device_info_json, price,
+                    datetime.now().isoformat(), 
+                    session_info.get('quality_score', 0) if session_info else 0,
+                    session_info.get('verification_level', 'basic') if session_info else 'basic'
+                ))
+                
+                approved_id = cursor.lastrowid
+                conn.commit()
+                
+                # If Firebase is enabled, sync to Firebase
+                if self.firebase_enabled:
+                    try:
+                        approved_data = {
+                            'approved_id': approved_id,
+                            'seller_id': user_id,
+                            'phone_number': phone_number,
+                            'country_code': country_code,
+                            'session_path': session_path,
+                            'firebase_session_id': firebase_session_id,
+                            'device_info': session_info.get('device_info', {}) if session_info else {},
+                            'price': price,
+                            'listed_at': datetime.now().isoformat(),
+                            'quality_score': session_info.get('quality_score', 0) if session_info else 0,
+                            'verification_level': session_info.get('verification_level', 'basic') if session_info else 'basic',
+                            'sync_version': '2.0'
+                        }
+                        
+                        # Don't store raw session string in Firebase
+                        self.db.collection('approved_sessions').document(firebase_session_id).set(approved_data)
+                        logger.info(f"Synced approved session {firebase_session_id} to Firebase")
+                    except Exception as firebase_e:
+                        logger.error(f"Error syncing approved session to Firebase: {firebase_e}")
+                
+                logger.info(f"Added approved session for user {user_id} with price ${price}")
+                return True
+        except Exception as e:
+            logger.error(f"Error adding approved session: {e}")
+            return False
+    
+    def create_backup(self) -> bool:
+        """Create a backup of the database"""
+        try:
+            import shutil
+            from datetime import datetime
+            
+            backup_path = f"{self.db_path}.backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            shutil.copy2(self.db_path, backup_path)
+            logger.info(f"Database backup created: {backup_path}")
+            return True
+        except Exception as e:
+            logger.error(f"Error creating database backup: {e}")
+            return False
+    
+    def repair_database(self) -> bool:
+        """Attempt to repair database corruption"""
+        try:
+            import subprocess
+            import os
+            
+            # Check if the database file exists
+            if not os.path.exists(self.db_path):
+                logger.error(f"Database file not found: {self.db_path}")
+                return False
+            
+            # Create a backup before attempting repair
+            self.create_backup()
+            
+            # Try SQLite integrity check first
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("PRAGMA integrity_check")
+                    result = cursor.fetchone()
+                    if result[0] == 'ok':
+                        logger.info("Database integrity check passed")
+                        return True
+                    else:
+                        logger.warning(f"Database integrity check failed: {result[0]}")
+            except Exception as integrity_e:
+                logger.error(f"Database integrity check failed: {integrity_e}")
+            
+            # Try to repair using vacuum
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    conn.execute("VACUUM")
+                    conn.commit()
+                    logger.info("Database vacuum completed successfully")
+                    return True
+            except Exception as vacuum_e:
+                logger.error(f"Database vacuum failed: {vacuum_e}")
+            
+            # If all else fails, try to recreate from backup
+            backup_files = [f for f in os.listdir(os.path.dirname(self.db_path)) if f.startswith(f"{os.path.basename(self.db_path)}.backup_")]
+            if backup_files:
+                latest_backup = max(backup_files, key=lambda x: os.path.getmtime(os.path.join(os.path.dirname(self.db_path), x)))
+                backup_path = os.path.join(os.path.dirname(self.db_path), latest_backup)
+                
+                try:
+                    shutil.copy2(backup_path, self.db_path)
+                    logger.info(f"Database restored from backup: {backup_path}")
+                    return True
+                except Exception as restore_e:
+                    logger.error(f"Failed to restore from backup: {restore_e}")
+            
+            return False
+            
+        except Exception as e:
+            logger.error(f"Database repair failed: {e}")
+            return False
+    
+    def close(self):
+        """Close database connections"""
+        try:
+            # SQLite connections are automatically closed with context managers
+            # This method is here for interface compatibility
+            logger.info("Database connections closed")
+        except Exception as e:
+            logger.error(f"Error closing database connections: {e}")
+    
+    def check_database_health(self) -> bool:
+        """Check if database is healthy and accessible"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' LIMIT 1")
+                result = cursor.fetchone()
+                return result is not None
+        except Exception as e:
+            logger.error(f"Database health check failed: {e}")
             return False
 
 # Global database instance

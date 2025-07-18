@@ -33,7 +33,6 @@ class NetworkMonitor:
             # Test HTTP connection
             connector = aiohttp.TCPConnector(
                 limit=5,
-                keepalive_timeout=10,
                 enable_cleanup_closed=True
             )
             
@@ -58,7 +57,6 @@ class NetworkMonitor:
             
             connector = aiohttp.TCPConnector(
                 limit=5,
-                keepalive_timeout=10,
                 enable_cleanup_closed=True
             )
             
@@ -82,31 +80,57 @@ class NetworkMonitor:
     async def check_telegram_connectivity(self) -> Tuple[bool, Optional[str]]:
         """Check Telegram API connectivity"""
         try:
-            # Test Telegram API endpoints
+            # Test Telegram API endpoints with more comprehensive list
             endpoints = [
                 'https://api.telegram.org',
                 'https://149.154.167.50',  # Telegram DC1
-                'https://149.154.175.50'   # Telegram DC2
+                'https://149.154.175.50',  # Telegram DC2
+                'https://149.154.175.100', # Telegram DC3
+                'https://149.154.167.91',  # Telegram DC4
+                'https://149.154.171.5',   # Telegram DC5
+                'https://telegram.org',    # Main Telegram site
             ]
             
             connector = aiohttp.TCPConnector(
-                limit=5,
-                keepalive_timeout=10,
-                enable_cleanup_closed=True
+                limit=10,
+                enable_cleanup_closed=True,
+                force_close=True,
+                limit_per_host=3
             )
             
-            async with aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=15)) as session:
+            successful_endpoints = []
+            failed_endpoints = []
+            
+            async with aiohttp.ClientSession(
+                connector=connector, 
+                timeout=aiohttp.ClientTimeout(total=20, connect=5)
+            ) as session:
                 for endpoint in endpoints:
                     try:
-                        async with session.get(endpoint) as response:
+                        async with session.get(endpoint, allow_redirects=True) as response:
                             # Any response indicates connectivity
                             if response.status < 500:
-                                return True, None
+                                successful_endpoints.append(endpoint)
+                                logger.debug(f"Telegram endpoint {endpoint} accessible (status: {response.status})")
+                            else:
+                                failed_endpoints.append(f"{endpoint} (status: {response.status})")
+                    except asyncio.TimeoutError:
+                        failed_endpoints.append(f"{endpoint} (timeout)")
+                        logger.debug(f"Telegram endpoint {endpoint} timed out")
+                        continue
                     except Exception as e:
+                        failed_endpoints.append(f"{endpoint} ({str(e)})")
                         logger.debug(f"Telegram endpoint {endpoint} failed: {e}")
                         continue
                         
-            return False, "All Telegram endpoints unreachable"
+            # Consider it successful if at least one endpoint is reachable
+            if successful_endpoints:
+                logger.info(f"Telegram connectivity OK - {len(successful_endpoints)}/{len(endpoints)} endpoints accessible")
+                return True, None
+            else:
+                error_msg = f"All Telegram endpoints unreachable. Failed endpoints: {', '.join(failed_endpoints[:3])}"
+                logger.error(error_msg)
+                return False, error_msg
             
         except Exception as e:
             return False, str(e)
@@ -251,10 +275,60 @@ class NetworkMonitor:
         
         if not self.telegram_status['healthy']:
             recommendations['actions'].append("Increase Telegram timeout settings")
-            recommendations['settings']['telegram_timeout'] = 120
-            recommendations['settings']['telegram_retries'] = 5
+            recommendations['actions'].append("Enable Telegram fallback mode")
+            recommendations['settings']['telegram_timeout'] = 180
+            recommendations['settings']['telegram_retries'] = 10
+            recommendations['settings']['telegram_fallback_enabled'] = True
+            recommendations['settings']['telegram_connection_retries'] = 5
         
         return recommendations
+    
+    async def handle_telegram_connectivity_issues(self) -> Dict:
+        """Handle Telegram connectivity issues with fallback strategies"""
+        try:
+            logger.info("Handling Telegram connectivity issues...")
+            
+            # First, try a comprehensive health check
+            await self.perform_health_check()
+            
+            if self.telegram_status['healthy']:
+                return {'status': 'recovered', 'message': 'Telegram connectivity restored'}
+            
+            # If still unhealthy, try alternative approaches
+            recommendations = self.get_recommendations()
+            
+            # Wait for potential recovery
+            logger.info("Waiting for Telegram connectivity recovery...")
+            recovery_attempts = 0
+            max_recovery_attempts = 3
+            
+            while recovery_attempts < max_recovery_attempts:
+                await asyncio.sleep(30)  # Wait 30 seconds between attempts
+                
+                # Check connectivity again
+                healthy, error = await self.check_telegram_connectivity()
+                if healthy:
+                    logger.info("Telegram connectivity recovered!")
+                    self.telegram_status = {
+                        'healthy': True,
+                        'last_check': datetime.now(),
+                        'error': None
+                    }
+                    return {'status': 'recovered', 'message': 'Telegram connectivity recovered after retry'}
+                
+                recovery_attempts += 1
+                logger.warning(f"Telegram recovery attempt {recovery_attempts}/{max_recovery_attempts} failed")
+            
+            # If all recovery attempts failed, return current recommendations
+            return {
+                'status': 'failed',
+                'message': 'Telegram connectivity could not be restored',
+                'recommendations': recommendations
+            }
+            
+        except Exception as e:
+            logger.error(f"Error handling Telegram connectivity issues: {e}")
+            return {'status': 'error', 'message': str(e)}
 
 
 # Global network monitor instance
