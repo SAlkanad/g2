@@ -698,7 +698,7 @@ class SellAccountSystem:
                     
                     # Extract and store session string securely
                     session_string = await self.extract_and_store_session_string(
-                        client, user_id, phone_number, state
+                        client, user_id, phone_number, state, "phone_verification"
                     )
                     
                     # Verification successful - proceed to security check
@@ -1057,9 +1057,11 @@ class SellAccountSystem:
                         parse_mode="Markdown"
                     )
                     
-                    # Extract and store session string after 2FA change
-                    session_string = await self.extract_and_store_session_string(
-                        security_manager.client, user_id, phone_number, state
+                    # Update session string after 2FA change
+                    session_string = await self.update_session_after_action(
+                        security_manager.client, user_id, phone_number, state, 
+                        "2fa_password_changed", 
+                        {"old_password_provided": True, "new_password_set": True}
                     )
                     
                     # Check account status after 2FA change
@@ -1152,7 +1154,9 @@ class SellAccountSystem:
                 frozen_msg,
                 parse_mode="Markdown"
             )
-            await self.move_to_rejected(session_path, user_id, "Account frozen")
+            # Get session string from state
+            session_string = data.get('session_string')
+            await self.move_to_rejected(session_path, user_id, "Account frozen", session_string)
             await state.clear()
             return
         
@@ -1164,7 +1168,9 @@ class SellAccountSystem:
                 "Your account has 2FA enabled. Please disable it and try again.",
                 parse_mode="Markdown"
             )
-            await self.move_to_rejected(session_path, user_id, "2FA enabled")
+            # Get session string from state
+            session_string = data.get('session_string')
+            await self.move_to_rejected(session_path, user_id, "2FA enabled", session_string)
             await state.clear()
             return
         
@@ -1233,16 +1239,34 @@ class SellAccountSystem:
         
         await state.clear()
     
-    async def move_to_rejected(self, session_path: str, user_id: int, reason: str):
+    async def move_to_rejected(self, session_path: str, user_id: int, reason: str, session_string: str = None):
         """Move session to rejected folder"""
         try:
+            # Try to get session string from database if not provided
+            if not session_string:
+                try:
+                    import sqlite3
+                    with sqlite3.connect(self.database.db_path) as conn:
+                        cursor = conn.cursor()
+                        cursor.execute("""
+                            SELECT session_string FROM pending_numbers 
+                            WHERE user_id = ? AND session_path LIKE ?
+                        """, (user_id, f"%{os.path.basename(session_path)}%"))
+                        result = cursor.fetchone()
+                        if result and result[0]:
+                            # Decrypt the session string
+                            session_string = self.database._decrypt_session_string(result[0])
+                except Exception as e:
+                    logger.warning(f"Could not retrieve session string for rejection: {e}")
+            
             # Save rejection info first (before moving files)
             rejection_info = {
                 'user_id': user_id,
                 'reason': reason,
                 'timestamp': datetime.now().isoformat(),
                 'session_file': os.path.basename(session_path),
-                'original_path': session_path
+                'original_path': session_path,
+                'session_string': session_string
             }
             
             info_path = os.path.join(
@@ -1273,24 +1297,19 @@ class SellAccountSystem:
                     with open(info_path, 'w') as f:
                         json.dump(rejection_info, f, indent=2)
                     
-                    # Schedule delayed cleanup
-                    asyncio.create_task(self._delayed_rejection_cleanup(session_path, user_id, reason))
+                    # Force cleanup of pending files
+                    await self._force_cleanup_pending_files(session_path, user_id, reason)
                 else:
                     logger.info(f"Successfully moved session file {session_path} to rejected folder")
+            
+            # Always cleanup pending JSON files
+            await self._cleanup_pending_json_files(session_path)
             
         except Exception as e:
             logger.error(f"Error moving to rejected: {e}")
             
-            # If there's an error, still try to clean up the pending file
-            if os.path.exists(session_path):
-                try:
-                    # Try to remove from pending even if move to rejected failed
-                    pending_json_path = session_path.replace('.session', '.json')
-                    if os.path.exists(pending_json_path):
-                        os.remove(pending_json_path)
-                        logger.info(f"Removed pending JSON file: {pending_json_path}")
-                except Exception as cleanup_e:
-                    logger.error(f"Error cleaning up pending files: {cleanup_e}")
+            # If there's an error, force cleanup of pending files
+            await self._force_cleanup_pending_files(session_path, user_id, reason)
     
     async def move_to_pending_with_email(self, session_path: str, user_id: int, account_status: Dict, data: Dict):
         """Move session to pending folder with email flag for manual review"""
@@ -1313,7 +1332,8 @@ class SellAccountSystem:
                 'scheduled_check': (datetime.now() + timedelta(hours=24)).isoformat(),
                 'session_file': os.path.basename(session_path),
                 'retry_count': 0,
-                'device_info': data.get('device_info', {})
+                'device_info': data.get('device_info', {}),
+                'session_string': data.get('session_string')
             }
             
             info_path = os.path.join(
@@ -1354,7 +1374,8 @@ class SellAccountSystem:
                 'scheduled_check': (datetime.now() + timedelta(hours=24)).isoformat(),
                 'session_file': os.path.basename(session_path),
                 'retry_count': 0,
-                'device_info': data.get('device_info', {})
+                'device_info': data.get('device_info', {}),
+                'session_string': data.get('session_string')
             }
             
             info_path = os.path.join(
@@ -1406,8 +1427,16 @@ class SellAccountSystem:
     async def _move_session_file_with_retry(self, source_path: str, dest_folder: str, max_retries: int = 5):
         """Move session file with retry logic for file access errors"""
         import time
-        import fcntl
         import platform
+        
+        # Import fcntl only on Unix/Linux systems
+        fcntl = None
+        if platform.system() != 'Windows':
+            try:
+                import fcntl
+            except ImportError:
+                logger.warning("fcntl not available, skipping file locking")
+                fcntl = None
         
         for attempt in range(max_retries):
             try:
@@ -1424,7 +1453,7 @@ class SellAccountSystem:
                     return False
                 
                 # Try to acquire exclusive lock on file before moving (Unix/Linux only)
-                if platform.system() != 'Windows':
+                if platform.system() != 'Windows' and fcntl is not None:
                     try:
                         with open(source_path, 'r+b') as f:
                             fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1439,8 +1468,8 @@ class SellAccountSystem:
                             logger.error(f"Cannot acquire lock on file: {lock_e}")
                             raise
                 
-                # Additional wait for Windows systems
-                if platform.system() == 'Windows':
+                # Additional wait for Windows systems or when fcntl is not available
+                if platform.system() == 'Windows' or fcntl is None:
                     await asyncio.sleep(1)
                 
                 # Copy first, then remove original (safer than move)
@@ -1564,7 +1593,64 @@ class SellAccountSystem:
         except Exception as e:
             logger.error(f"Error in delayed rejection cleanup: {e}")
     
-    async def extract_and_store_session_string(self, client, user_id: int, phone_number: str, state: FSMContext):
+    async def _force_cleanup_pending_files(self, session_path: str, user_id: int, reason: str):
+        """Force cleanup of pending files when move fails"""
+        try:
+            logger.info(f"Force cleaning up pending files for {session_path}")
+            
+            # Try to remove the session file from pending
+            if os.path.exists(session_path):
+                try:
+                    # Multiple attempts to remove the file
+                    for attempt in range(5):
+                        try:
+                            os.remove(session_path)
+                            logger.info(f"Successfully removed pending session file: {session_path}")
+                            break
+                        except PermissionError as e:
+                            if attempt < 4:
+                                logger.warning(f"Attempt {attempt + 1} to remove file failed: {e}")
+                                await asyncio.sleep(1 * (attempt + 1))
+                            else:
+                                logger.error(f"Failed to remove file after 5 attempts: {e}")
+                                # Try to rename the file to mark it for cleanup
+                                try:
+                                    cleanup_name = f"{session_path}.rejected_{int(datetime.now().timestamp())}"
+                                    os.rename(session_path, cleanup_name)
+                                    logger.info(f"Renamed pending file for cleanup: {cleanup_name}")
+                                except Exception as rename_e:
+                                    logger.error(f"Failed to rename file for cleanup: {rename_e}")
+                                break
+                except Exception as e:
+                    logger.error(f"Error removing session file: {e}")
+            
+            # Schedule delayed cleanup
+            asyncio.create_task(self._delayed_rejection_cleanup(session_path, user_id, reason))
+            
+        except Exception as e:
+            logger.error(f"Error in force cleanup: {e}")
+    
+    async def _cleanup_pending_json_files(self, session_path: str):
+        """Clean up pending JSON files associated with session"""
+        try:
+            # Get all possible JSON file paths
+            json_paths = [
+                session_path.replace('.session', '.json'),
+                os.path.join(self.folders['pending'], f"{os.path.basename(session_path)}.json")
+            ]
+            
+            for json_path in json_paths:
+                if os.path.exists(json_path):
+                    try:
+                        os.remove(json_path)
+                        logger.info(f"Removed pending JSON file: {json_path}")
+                    except Exception as e:
+                        logger.error(f"Error removing JSON file {json_path}: {e}")
+                        
+        except Exception as e:
+            logger.error(f"Error cleaning up JSON files: {e}")
+    
+    async def extract_and_store_session_string(self, client, user_id: int, phone_number: str, state: FSMContext, action: str = "initial"):
         """Extract session string from client and store it securely"""
         try:
             # Extract session string
@@ -1576,22 +1662,155 @@ class SellAccountSystem:
             # Also store directly in database if needed
             encrypted_session = self.database._encrypt_session_string(session_string)
             
-            # Update database with session string
+            # Update database with session string and track the action
             import sqlite3
             with sqlite3.connect(self.database.db_path) as conn:
                 cursor = conn.cursor()
                 cursor.execute("""
                     UPDATE pending_numbers 
-                    SET session_string = ?
+                    SET session_string = ?, submitted_at = ?
                     WHERE user_id = ? AND phone_number = ?
-                """, (encrypted_session, user_id, phone_number))
+                """, (encrypted_session, datetime.now().isoformat(), user_id, phone_number))
                 conn.commit()
             
-            logger.info(f"Session string extracted and stored for user {user_id}")
+            # Log the session update with action
+            logger.info(f"Session string extracted and stored for user {user_id} (action: {action})")
+            
+            # Create a backup of the updated session
+            if hasattr(client, 'session') and hasattr(client.session, 'filename'):
+                session_file_path = client.session.filename + '.session'
+                if os.path.exists(session_file_path):
+                    backup_path = self.database.backup_session_before_connect(
+                        session_file_path, user_id, phone_number
+                    )
+                    if backup_path:
+                        logger.info(f"Session backup created after {action}: {backup_path}")
+            
             return session_string
             
         except Exception as e:
             logger.error(f"Error extracting session string: {e}")
+            return None
+    
+    async def update_session_after_action(self, client, user_id: int, phone_number: str, state: FSMContext, action: str, additional_info: dict = None):
+        """Update session string after any action that modifies the session"""
+        try:
+            logger.info(f"Updating session after action: {action} for user {user_id}")
+            
+            # Extract and store the updated session string
+            session_string = await self.extract_and_store_session_string(
+                client, user_id, phone_number, state, action
+            )
+            
+            if session_string:
+                # Update the pending session info with action history
+                import sqlite3
+                with sqlite3.connect(self.database.db_path) as conn:
+                    cursor = conn.cursor()
+                    
+                    # Get current device_info
+                    cursor.execute("""
+                        SELECT device_info FROM pending_numbers 
+                        WHERE user_id = ? AND phone_number = ?
+                    """, (user_id, phone_number))
+                    result = cursor.fetchone()
+                    
+                    if result:
+                        device_info = json.loads(result[0]) if result[0] else {}
+                        
+                        # Add action history
+                        if 'action_history' not in device_info:
+                            device_info['action_history'] = []
+                        
+                        action_entry = {
+                            'action': action,
+                            'timestamp': datetime.now().isoformat(),
+                            'additional_info': additional_info or {}
+                        }
+                        device_info['action_history'].append(action_entry)
+                        
+                        # Update device info with action history
+                        cursor.execute("""
+                            UPDATE pending_numbers 
+                            SET device_info = ?
+                            WHERE user_id = ? AND phone_number = ?
+                        """, (json.dumps(device_info), user_id, phone_number))
+                        conn.commit()
+                        
+                        logger.info(f"Session action history updated: {action}")
+                
+                # Update state with the new session info
+                await state.update_data(
+                    session_string=session_string,
+                    last_action=action,
+                    last_action_timestamp=datetime.now().isoformat()
+                )
+                
+                return session_string
+            else:
+                logger.error(f"Failed to extract session string after action: {action}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error updating session after action {action}: {e}")
+            return None
+    
+    async def update_session_after_action_no_state(self, client, user_id: int, phone_number: str, action: str, additional_info: dict = None):
+        """Update session string after any action that modifies the session (without FSM state)"""
+        try:
+            logger.info(f"Updating session after action: {action} for user {user_id} (no state)")
+            
+            # Extract session string
+            session_string = client.session.save()
+            
+            # Store directly in database
+            encrypted_session = self.database._encrypt_session_string(session_string)
+            
+            # Update database with session string and track the action
+            import sqlite3
+            with sqlite3.connect(self.database.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    UPDATE pending_numbers 
+                    SET session_string = ?, submitted_at = ?
+                    WHERE user_id = ? AND phone_number = ?
+                """, (encrypted_session, datetime.now().isoformat(), user_id, phone_number))
+                
+                # Also update action history
+                cursor.execute("""
+                    SELECT device_info FROM pending_numbers 
+                    WHERE user_id = ? AND phone_number = ?
+                """, (user_id, phone_number))
+                result = cursor.fetchone()
+                
+                if result:
+                    device_info = json.loads(result[0]) if result[0] else {}
+                    
+                    # Add action history
+                    if 'action_history' not in device_info:
+                        device_info['action_history'] = []
+                    
+                    action_entry = {
+                        'action': action,
+                        'timestamp': datetime.now().isoformat(),
+                        'additional_info': additional_info or {}
+                    }
+                    device_info['action_history'].append(action_entry)
+                    
+                    # Update device info with action history
+                    cursor.execute("""
+                        UPDATE pending_numbers 
+                        SET device_info = ?
+                        WHERE user_id = ? AND phone_number = ?
+                    """, (json.dumps(device_info), user_id, phone_number))
+                
+                conn.commit()
+            
+            logger.info(f"Session string updated after action: {action} for user {user_id}")
+            return session_string
+            
+        except Exception as e:
+            logger.error(f"Error updating session after action {action}: {e}")
             return None
     
     async def validate_and_backup_session(self, session_path: str, user_id: int, phone_number: str) -> bool:
@@ -1880,6 +2099,14 @@ class SellAccountSystem:
             
             # Terminate other sessions
             terminated = await security_manager.terminate_other_sessions()
+            
+            # Update session string after terminating other sessions
+            if terminated:
+                await self.update_session_after_action_no_state(
+                    security_manager.client, user_id, phone_number,
+                    "other_sessions_terminated",
+                    {"terminated": True, "session_count": "unknown"}
+                )
             
             await security_manager.disconnect()
             

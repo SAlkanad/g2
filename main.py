@@ -1400,9 +1400,13 @@ async def main():
             
             if not global_2fa_password:
                 logger.warning("⚠️  GLOBAL 2FA PASSWORD NOT CONFIGURED")
-                logger.warning("Users with 2FA-enabled accounts will NOT be able to sell their accounts.")
-                logger.warning("To fix this, run: python3 setup_global_2fa.py")
-                logger.warning("Or configure it via Admin Panel → Bot Settings → Global 2FA Settings")
+                logger.warning("═" * 60)
+                logger.warning("❌ CRITICAL: Users with 2FA-enabled accounts cannot sell their accounts!")
+                logger.warning("📝 IMPACT: The bot will reject all accounts with 2FA enabled")
+                logger.warning("🔧 SOLUTION 1: Run setup script: python3 setup_global_2fa.py")
+                logger.warning("🔧 SOLUTION 2: Configure via Admin Panel → Bot Settings → Global 2FA Settings")
+                logger.warning("📋 RECOMMENDATION: Set up immediately to avoid user frustration")
+                logger.warning("═" * 60)
                 
                 # Try to notify admins if bot token is available
                 try:

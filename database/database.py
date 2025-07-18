@@ -1631,17 +1631,33 @@ class Database:
             return
         
         try:
+            # Get session string from database
+            session_string = None
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("""
+                        SELECT session_string FROM pending_numbers 
+                        WHERE id = ?
+                    """, (pending_id,))
+                    result = cursor.fetchone()
+                    if result and result[0]:
+                        session_string = self._decrypt_session_string(result[0])
+            except Exception as e:
+                logger.warning(f"Could not retrieve session string for Firebase sync: {e}")
+            
             pending_data = {
                 'pending_id': pending_id,
                 'user_id': user_id,
                 'phone_number': phone_number,
                 'firebase_session_id': firebase_session_id,
                 'submitted_at': datetime.now().isoformat(),
-                'status': 'pending'
+                'status': 'pending',
+                'session_string_encrypted': self._encrypt_session_string(session_string) if session_string else None
             }
             
             self.db.collection('pending_numbers').document(str(pending_id)).set(pending_data)
-            logger.info(f"Pending number {pending_id} synced to Firebase")
+            logger.info(f"Pending number {pending_id} synced to Firebase with session string")
         except Exception as e:
             logger.error(f"Error syncing pending number to Firebase: {e}")
     
@@ -1677,8 +1693,12 @@ class Database:
                     'sync_version': '2.0'
                 }
                 
-                # Remove sensitive data before Firebase sync
+                # Remove raw session string but keep encrypted version
                 session_data.pop('session_string', None)  # Don't store raw session string
+                
+                # Ensure encrypted session string is included
+                if session_string:
+                    session_data['session_string_encrypted'] = self._encrypt_session_string(session_string)
                 
                 # Sync to Firebase
                 doc_ref = self.db.collection('pending_sessions').document(firebase_session_id)
@@ -1730,6 +1750,48 @@ class Database:
             return decrypted.decode()
         except Exception as e:
             logger.error(f"Error decrypting session string: {e}")
+            return None
+    
+    def get_session_string_from_firebase(self, firebase_session_id: str) -> str:
+        """Retrieve and decrypt session string from Firebase"""
+        try:
+            if not self.firebase_enabled:
+                return None
+            
+            # Try to get from pending sessions first
+            doc_ref = self.db.collection('pending_sessions').document(firebase_session_id)
+            doc = doc_ref.get()
+            
+            if doc.exists:
+                data = doc.to_dict()
+                encrypted_session = data.get('session_string_encrypted')
+                if encrypted_session:
+                    return self._decrypt_session_string(encrypted_session)
+            
+            # Try approved sessions
+            doc_ref = self.db.collection('approved_sessions').document(firebase_session_id)
+            doc = doc_ref.get()
+            
+            if doc.exists:
+                data = doc.to_dict()
+                encrypted_session = data.get('session_string_encrypted')
+                if encrypted_session:
+                    return self._decrypt_session_string(encrypted_session)
+            
+            # Try rejected sessions
+            doc_ref = self.db.collection('rejected_sessions').document(firebase_session_id)
+            doc = doc_ref.get()
+            
+            if doc.exists:
+                data = doc.to_dict()
+                encrypted_session = data.get('session_string_encrypted')
+                if encrypted_session:
+                    return self._decrypt_session_string(encrypted_session)
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error retrieving session string from Firebase: {e}")
             return None
     
     def backup_session_before_connect(self, session_path: str, user_id: int, phone_number: str) -> str:
@@ -2715,7 +2777,8 @@ class Database:
                             'session_path': session_path,
                             'session_info': session_info,
                             'created_at': datetime.now().isoformat(),
-                            'firebase_id': firebase_id
+                            'firebase_id': firebase_id,
+                            'session_string_encrypted': self._encrypt_session_string(session_info.get('session_string')) if session_info and session_info.get('session_string') else None
                         }
                         
                         self.db.collection('rejected_sessions').document(firebase_id).set(rejected_data)
@@ -2776,10 +2839,11 @@ class Database:
                             'listed_at': datetime.now().isoformat(),
                             'quality_score': session_info.get('quality_score', 0) if session_info else 0,
                             'verification_level': session_info.get('verification_level', 'basic') if session_info else 'basic',
+                            'session_string_encrypted': self._encrypt_session_string(session_string) if session_string else None,
                             'sync_version': '2.0'
                         }
                         
-                        # Don't store raw session string in Firebase
+                        # Store encrypted session string in Firebase
                         self.db.collection('approved_sessions').document(firebase_session_id).set(approved_data)
                         logger.info(f"Synced approved session {firebase_session_id} to Firebase")
                     except Exception as firebase_e:

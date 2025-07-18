@@ -27,21 +27,40 @@ class NetworkMonitor:
     async def check_internet_connectivity(self) -> Tuple[bool, Optional[str]]:
         """Check basic internet connectivity"""
         try:
-            # Test DNS resolution
-            socket.gethostbyname('google.com')
+            # Test multiple endpoints to ensure connectivity
+            test_endpoints = [
+                'https://httpbin.org/get',
+                'https://www.google.com',
+                'https://cloudflare.com',
+                'https://8.8.8.8'
+            ]
             
-            # Test HTTP connection
             connector = aiohttp.TCPConnector(
                 limit=5,
                 enable_cleanup_closed=True
             )
             
+            successful_connections = 0
+            
             async with aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=10)) as session:
-                async with session.get('https://httpbin.org/get') as response:
-                    if response.status == 200:
-                        return True, None
-                    else:
-                        return False, f"HTTP status: {response.status}"
+                for endpoint in test_endpoints:
+                    try:
+                        async with session.get(endpoint) as response:
+                            if response.status < 400:
+                                successful_connections += 1
+                                logger.debug(f"Internet connectivity test successful: {endpoint}")
+                            else:
+                                logger.debug(f"Internet connectivity test failed: {endpoint} (status: {response.status})")
+                    except Exception as endpoint_e:
+                        logger.debug(f"Internet connectivity test failed: {endpoint} ({endpoint_e})")
+                        continue
+                
+                # Consider internet as available if at least one endpoint is reachable
+                if successful_connections > 0:
+                    logger.info(f"Internet connectivity OK - {successful_connections}/{len(test_endpoints)} endpoints accessible")
+                    return True, None
+                else:
+                    return False, "All internet test endpoints unreachable"
                         
         except Exception as e:
             return False, str(e)
